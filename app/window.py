@@ -7,6 +7,8 @@ from PySide6.QtWidgets import (
 	QTabWidget, QTableWidget, QTableWidgetItem, QComboBox, QMessageBox, QFormLayout,
 	QSpinBox, QDoubleSpinBox, QFileDialog, QMenu, QStyledItemDelegate, QDialog, QDialogButtonBox, QDateTimeEdit, QDateEdit, QProgressBar, QTextBrowser
 )
+import json
+import requests
 
 from .finance import (
 	FinanceState,
@@ -30,7 +32,6 @@ from .store import AppStorage as Storage
 from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg as FigureCanvas
 from matplotlib.figure import Figure
 import pandas as pd
-import requests
 
 SUPPORTED_CURRENCIES = [
 	"RUB", "USD", "EUR", "GBP", "CNY", "JPY", "KZT", "UAH"
@@ -135,6 +136,11 @@ class FinanceWindow(QMainWindow):
 		self._backup_timer.setTimerType(Qt.VeryCoarseTimer)
 		self._backup_timer.timeout.connect(self._auto_backup_tick)
 
+		# Telegram polling timer
+		self._tg_timer = QTimer(self)
+		self._tg_timer.setTimerType(Qt.VeryCoarseTimer)
+		self._tg_timer.timeout.connect(self._poll_telegram_updates)
+
 		self.tabs = QTabWidget()
 		self.setCentralWidget(self.tabs)
 
@@ -147,6 +153,7 @@ class FinanceWindow(QMainWindow):
 		self._build_help_tab()
 		self._build_export_tab()
 		self._build_currency_tab()
+		self._build_chat_tab()
 
 		self._build_menu()
 		self._apply_theme(self.storage.state.settings.get("theme", "light"))
@@ -350,6 +357,31 @@ class FinanceWindow(QMainWindow):
 		row_actions.addWidget(btn_reset_settings)
 		row_actions.addStretch(1)
 		root.addLayout(row_actions)
+
+		# Telegram settings
+		hdr_tg = QLabel("Telegram")
+		hdr_tg.setStyleSheet("font-weight:600; margin: 12px 0 6px;")
+		root.addWidget(hdr_tg)
+		form_tg = QFormLayout()
+		self.tg_token = QLineEdit()
+		self.tg_token.setEchoMode(QLineEdit.Password)
+		self.tg_token.editingFinished.connect(self._save_tg_settings)
+		self.tg_chat = QLineEdit()
+		self.tg_chat.setPlaceholderText("chat_id (число)")
+		self.tg_chat.editingFinished.connect(self._save_tg_settings)
+		self.tg_poll_enable = QComboBox()
+		self.tg_poll_enable.addItems(["Выкл.", "Вкл."])
+		self.tg_poll_enable.currentIndexChanged.connect(self._save_tg_settings)
+		self.tg_poll_minutes = QSpinBox()
+		self.tg_poll_minutes.setRange(1, 1440)
+		self.tg_poll_minutes.setValue(1)
+		self.tg_poll_minutes.setSuffix(" мин")
+		self.tg_poll_minutes.valueChanged.connect(self._save_tg_settings)
+		form_tg.addRow("Bot token:", self.tg_token)
+		form_tg.addRow("Chat ID:", self.tg_chat)
+		form_tg.addRow("Опрос:", self.tg_poll_enable)
+		form_tg.addRow("Интервал опроса:", self.tg_poll_minutes)
+		root.addLayout(form_tg)
 
 		self.tabs.addTab(w, "Настройки")
 
@@ -744,6 +776,17 @@ class FinanceWindow(QMainWindow):
 		self.backup_minutes.setValue(max(5, min(1440, minutes)))
 		self.backup_minutes.blockSignals(False)
 		self._configure_backup_timer()
+		# restore TG settings
+		self.tg_token.setText(self.storage.state.settings.get("tg_bot_token", ""))
+		self.tg_chat.setText(self.storage.state.settings.get("tg_chat_id", ""))
+		self.tg_poll_enable.setCurrentIndex(1 if str(self.storage.state.settings.get("tg_poll_enabled", "0")) == "1" else 0)
+		try:
+			self.tg_poll_minutes.setValue(int(self.storage.state.settings.get("tg_poll_minutes", "1")))
+		except Exception:
+			self.tg_poll_minutes.setValue(1)
+		self._configure_tg_timer()
+		# refresh recipients dropdown
+		self._refresh_contacts_ui()
 		self._refresh_breakdown_label(0.0)
 		self._refresh_balances()
 		self._refresh_filter_months()
@@ -1078,6 +1121,11 @@ class FinanceWindow(QMainWindow):
 		self.storage.state.settings["backup_enabled"] = "0"
 		self.storage.state.settings["backup_interval_minutes"] = "60"
 		self.storage.state.settings["backup_mode"] = "0"
+		self.storage.state.settings["tg_bot_token"] = ""
+		self.storage.state.settings["tg_chat_id"] = ""
+		self.storage.state.settings["tg_poll_enabled"] = "0"
+		self.storage.state.settings["tg_poll_minutes"] = "1"
+		self.storage.state.settings["tg_last_update_id"] = "0"
 		self.storage.save()
 		self._apply_theme("light")
 		if hasattr(self, "theme_combo"):
@@ -1086,8 +1134,13 @@ class FinanceWindow(QMainWindow):
 		self.backup_enable.setCurrentIndex(0)
 		self.backup_mode.setCurrentIndex(0)
 		self.backup_minutes.setValue(60)
+		self.tg_token.clear()
+		self.tg_chat.clear()
+		self.tg_poll_enable.setCurrentIndex(0)
+		self.tg_poll_minutes.setValue(1)
 		self._update_backup_controls_visibility()
 		self._configure_backup_timer()
+		self._configure_tg_timer()
 		QMessageBox.information(self, "Настройки", "Настройки сброшены к значениям по умолчанию.")
 
 	def _auto_backup_tick(self) -> None:
@@ -1185,3 +1238,173 @@ class FinanceWindow(QMainWindow):
 					pass
 		if not quiet:
 			QMessageBox.information(self, "Бэкап", f"Создан бэкап: {dst.name}")
+
+	# --- Chat (Telegram) ---
+	def _build_chat_tab(self) -> None:
+		w = QWidget()
+		v = QVBoxLayout(w)
+		self.chat_view = QTextBrowser()
+		self.chat_view.setPlaceholderText("Здесь будут сообщения из Telegram…")
+		v.addWidget(self.chat_view)
+
+		# Recipients row
+		rec_row = QHBoxLayout()
+		rec_row.addWidget(QLabel("Адресат:"))
+		self.chat_recipient = QComboBox()
+		self.chat_recipient.setEditable(False)
+		rec_row.addWidget(self.chat_recipient)
+		btn_refresh_now = QPushButton("Обновить сейчас")
+		btn_refresh_now.clicked.connect(self._refresh_chat_now)
+		rec_row.addWidget(btn_refresh_now)
+		btn_clear_rec = QPushButton("Очистить список")
+		btn_clear_rec.clicked.connect(self._clear_contacts)
+		rec_row.addWidget(btn_clear_rec)
+		rec_row.addStretch(1)
+		v.addLayout(rec_row)
+
+		row = QHBoxLayout()
+		self.chat_input = QLineEdit()
+		self.chat_input.setPlaceholderText("Напишите сообщение…")
+		btn_send = QPushButton("Отправить")
+		btn_send.clicked.connect(self._send_chat_message)
+		row.addWidget(self.chat_input)
+		row.addWidget(btn_send)
+		v.addLayout(row)
+		self.tabs.addTab(w, "Чат")
+
+	def _refresh_chat_now(self) -> None:
+		# Manual polling on demand
+		self._poll_telegram_updates()
+
+	def _load_contacts(self) -> dict:
+		try:
+			data = self.storage.state.settings.get("tg_contacts", "{}")
+			obj = json.loads(data) if isinstance(data, str) else {}
+			return obj if isinstance(obj, dict) else {}
+		except Exception:
+			return {}
+
+	def _save_contacts(self, contacts: dict) -> None:
+		try:
+			self.storage.state.settings["tg_contacts"] = json.dumps(contacts, ensure_ascii=False)
+			self.storage.save()
+		except Exception:
+			pass
+
+	def _add_contact(self, chat_id: str, name: str) -> None:
+		contacts = self._load_contacts()
+		if chat_id not in contacts:
+			contacts[chat_id] = name or chat_id
+			self._save_contacts(contacts)
+			self._refresh_contacts_ui(contacts)
+
+	def _refresh_contacts_ui(self, contacts: dict | None = None) -> None:
+		if contacts is None:
+			contacts = self._load_contacts()
+		cur = self.chat_recipient.currentData() if hasattr(self, 'chat_recipient') else None
+		self.chat_recipient.blockSignals(True)
+		self.chat_recipient.clear()
+		# Default option: Chat ID из настроек
+		default_chat = self.storage.state.settings.get("tg_chat_id", "")
+		if default_chat:
+			self.chat_recipient.addItem(f"По умолчанию ({default_chat})", default_chat)
+		for cid, name in contacts.items():
+			label = f"{name} ({cid})" if name and name != cid else cid
+			self.chat_recipient.addItem(label, cid)
+		# restore selection
+		if cur:
+			idx = self.chat_recipient.findData(cur)
+			if idx >= 0:
+				self.chat_recipient.setCurrentIndex(idx)
+		self.chat_recipient.blockSignals(False)
+
+	def _clear_contacts(self) -> None:
+		self._save_contacts({})
+		self._refresh_contacts_ui({})
+
+	def _send_chat_message(self) -> None:
+		text = self.chat_input.text().strip()
+		if not text:
+			return
+		token = self.storage.state.settings.get("tg_bot_token", "").strip()
+		if not token:
+			QMessageBox.warning(self, "Telegram", "Укажите токен бота в Настройках → Telegram.")
+			return
+		# resolve target chat id: selected in combo or default from settings
+		cid = self.chat_recipient.currentData() if hasattr(self, 'chat_recipient') else None
+		if not cid:
+			cid = self.storage.state.settings.get("tg_chat_id", "").strip()
+		if not cid:
+			QMessageBox.warning(self, "Telegram", "Не выбран адресат (Chat ID). Укажите его в Настройках или выберите в списке.")
+			return
+		try:
+			url = f"https://api.telegram.org/bot{token}/sendMessage"
+			resp = requests.post(url, json={"chat_id": cid, "text": text}, timeout=8)
+			if resp.status_code != 200 or not resp.json().get("ok"):
+				raise RuntimeError(resp.text)
+			self.chat_view.append(f"Вы → {cid}: {text}")
+			self.chat_input.clear()
+		except Exception as e:
+			QMessageBox.warning(self, "Telegram", f"Не удалось отправить: {e}")
+
+	def _poll_telegram_updates(self) -> None:
+		token = self.storage.state.settings.get("tg_bot_token", "").strip()
+		if not token:
+			return
+		try:
+			offset = int(self.storage.state.settings.get("tg_last_update_id", "0")) + 1
+			url = f"https://api.telegram.org/bot{token}/getUpdates"
+			resp = requests.get(url, params={"timeout": 0, "offset": offset}, timeout=8)
+			data = resp.json()
+			if not data.get("ok"):
+				return
+			for upd in data.get("result", []):
+				update_id = upd.get("update_id", 0)
+				msg = upd.get("message") or upd.get("edited_message")
+				if not msg:
+					continue
+				from_chat = msg.get("chat", {})
+				from_id = str(from_chat.get("id"))
+				first = from_chat.get("first_name", "")
+				last = from_chat.get("last_name", "")
+				username = from_chat.get("username", "")
+				name = username or (first + (" " + last if last else "")) or from_id
+				text = msg.get("text", "")
+				if text:
+					self.chat_view.append(f"{name}: {text}")
+				# store/update contact
+				self._add_contact(from_id, name)
+				self.storage.state.settings["tg_last_update_id"] = str(update_id)
+			self.storage.save()
+		except Exception:
+			pass
+
+	def _save_tg_settings(self) -> None:
+		# Save Telegram bot settings and reconfigure polling timer
+		if hasattr(self, "tg_token"):
+			self.storage.state.settings["tg_bot_token"] = self.tg_token.text().strip()
+		if hasattr(self, "tg_chat"):
+			self.storage.state.settings["tg_chat_id"] = self.tg_chat.text().strip()
+		if hasattr(self, "tg_poll_enable"):
+			self.storage.state.settings["tg_poll_enabled"] = "1" if self.tg_poll_enable.currentIndex() == 1 else "0"
+		if hasattr(self, "tg_poll_minutes"):
+			self.storage.state.settings["tg_poll_minutes"] = str(int(self.tg_poll_minutes.value()))
+		self.storage.save()
+		self._configure_tg_timer()
+
+	def _configure_tg_timer(self) -> None:
+		# Start/stop Telegram polling timer according to settings
+		enabled = str(self.storage.state.settings.get("tg_poll_enabled", "0")) == "1"
+		try:
+			minutes = int(self.storage.state.settings.get("tg_poll_minutes", "1"))
+		except Exception:
+			minutes = 1
+		if not hasattr(self, "_tg_timer"):
+			self._tg_timer = QTimer(self)
+			self._tg_timer.setTimerType(Qt.VeryCoarseTimer)
+			self._tg_timer.timeout.connect(self._poll_telegram_updates)
+		if enabled:
+			self._tg_timer.stop()
+			self._tg_timer.start(max(1, minutes) * 60 * 1000)
+		else:
+			self._tg_timer.stop()
